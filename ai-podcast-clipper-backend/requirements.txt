@@ -18,3 +18,5 @@ pysubs2
 boto3
 fastapi[standard]
 whisperx
+requests
+temporalio
