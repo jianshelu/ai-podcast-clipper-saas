@@ -10,7 +10,7 @@ from .activities_gpu import ping_gpu
 async def main():
     address = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
     namespace = os.getenv("TEMPORAL_NAMESPACE", "clipper")
-    task_queue = os.getenv("TEMPORAL_TASK_QUEUE_GPU", "gpu-tq")
+    task_queue = os.getenv("TEMPORAL_TASK_QUEUE_GPU", "tq-gpu")
 
     client = await Client.connect(address, namespace=namespace)
 

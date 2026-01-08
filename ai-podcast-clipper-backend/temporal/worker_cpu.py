@@ -9,7 +9,7 @@ from .activities_cpu import ping
 async def main():
     address = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
     namespace = os.getenv("TEMPORAL_NAMESPACE", "clipper")
-    task_queue = os.getenv("TEMPORAL_TASK_QUEUE_CPU", "cpu-tq")
+    task_queue = os.getenv("TEMPORAL_TASK_QUEUE_CPU", "tq-cpu")
 
     client = await Client.connect(address, namespace=namespace)
 
