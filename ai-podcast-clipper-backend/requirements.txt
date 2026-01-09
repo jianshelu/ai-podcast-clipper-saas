@@ -17,4 +17,5 @@ google-genai
 pysubs2
 boto3
 fastapi[standard]
+temporalio
 whisperx
