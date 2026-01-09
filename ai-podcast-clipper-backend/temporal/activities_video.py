@@ -1,20 +1,100 @@
-import os
-from urllib.parse import urlparse
+# temporal/activities_video.py
+import shutil
+import threading
+
 from temporalio import activity
 
+from video_processing import VideoProcessor, download_video, parse_clip_moments, process_clip
+
+_processor = None
+
+
+def _get_processor() -> VideoProcessor:
+    global _processor
+    if _processor is None:
+        _processor = VideoProcessor()
+        _processor.load_models()
+    return _processor
+
+
+def _run_with_heartbeat(func, interval_seconds: int = 30):
+    stop_event = threading.Event()
+
+    def _heartbeat_loop():
+        while not stop_event.wait(interval_seconds):
+            activity.heartbeat("working")
+
+    thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    thread.start()
+    try:
+        return func()
+    finally:
+        stop_event.set()
+        thread.join(timeout=interval_seconds)
+
+
 @activity.defn
-def process_video_activity(s3_key: str) -> str:
-    # 支持 file://
-    if s3_key.startswith("file://"):
-        local_path = urlparse(s3_key).path
-    else:
-        local_path = s3_key
+def update_job_activity(s3_key: str, status: str, stage: str) -> dict:
+    print(f"[job] s3_key={s3_key} status={status} stage={stage}")
+    return {"s3_key": s3_key, "status": status, "stage": stage}
 
-    if os.path.exists(local_path):
-        activity.logger.info(f"[video] using local file: {local_path}")
-        # 下面用 local_path 进入你现有的处理流程（ffmpeg/切片/转码等）
-        return f"ok(local): {local_path}"
 
-    # 否则走你原来的 S3 拉取逻辑
-    activity.logger.info(f"[video] fetching from s3 key: {s3_key}")
-    ...
+@activity.defn
+def transcribe_activity(s3_key: str) -> list:
+    processor = _get_processor()
+    base_dir = None
+    try:
+        base_dir, video_path, _ = download_video(s3_key)
+        return _run_with_heartbeat(lambda: processor.transcribe_video(base_dir, video_path))
+    finally:
+        if base_dir and base_dir.exists():
+            print(f"Cleaning up temp dir after {base_dir}")
+            shutil.rmtree(base_dir, ignore_errors=True)
+
+
+@activity.defn
+def highlight_activity(transcript_segments: list) -> list:
+    processor = _get_processor()
+    identified_moments_raw = processor.identify_moments(transcript_segments)
+    return parse_clip_moments(identified_moments_raw)
+
+
+@activity.defn
+def render_clips_activity(s3_key: str, transcript_segments: list, clip_moments: list) -> dict:
+    base_dir = None
+    try:
+        base_dir, video_path, s3_client = download_video(s3_key)
+        results = []
+
+        def _render():
+            for index, moment in enumerate(clip_moments[:5]):
+                if "start" in moment and "end" in moment:
+                    print("Processing clip" + str(index) + " from " +
+                          str(moment["start"]) + " to " + str(moment["end"]))
+                    result = process_clip(
+                        base_dir,
+                        video_path,
+                        s3_key,
+                        moment["start"],
+                        moment["end"],
+                        index,
+                        transcript_segments,
+                        s3_client=s3_client,
+                    )
+                    results.append(result)
+                    activity.heartbeat({"clip_index": index, "output": result.get("output_s3_key")})
+
+            return results
+
+        rendered = _run_with_heartbeat(_render)
+        return {"rendered": rendered, "clip_count": len(rendered)}
+    finally:
+        if base_dir and base_dir.exists():
+            print(f"Cleaning up temp dir after {base_dir}")
+            shutil.rmtree(base_dir, ignore_errors=True)
+
+
+@activity.defn
+def finalize_activity(s3_key: str, status: str) -> dict:
+    print(f"[job] s3_key={s3_key} status={status}")
+    return {"s3_key": s3_key, "status": status}

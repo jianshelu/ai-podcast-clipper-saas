@@ -5,12 +5,13 @@ from temporalio.worker import Worker
 
 from .workflows import HelloGpuWorkflow
 from .activities_gpu import ping_gpu
+from .activities_video import render_clips_activity, transcribe_activity
 
 
 async def main():
     address = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
     namespace = os.getenv("TEMPORAL_NAMESPACE", "clipper")
-    task_queue = os.getenv("TEMPORAL_TASK_QUEUE_GPU", "tq-gpu")
+    task_queue = os.getenv("TEMPORAL_TASK_QUEUE_GPU", "gpu-tq")
 
     client = await Client.connect(address, namespace=namespace)
 
@@ -18,7 +19,7 @@ async def main():
         client,
         task_queue=task_queue,
         workflows=[HelloGpuWorkflow],
-        activities=[ping_gpu],
+        activities=[ping_gpu, transcribe_activity, render_clips_activity],
     )
 
     print(f"GPU Worker started. address={address} namespace={namespace} task_queue={task_queue}")

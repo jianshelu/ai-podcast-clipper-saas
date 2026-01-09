@@ -17,6 +17,56 @@ import pysubs2
 from tqdm import tqdm
 import whisperx
 
+_ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".m4v"}
+
+
+def validate_s3_key(s3_key: str) -> None:
+    ext = pathlib.Path(s3_key).suffix.lower()
+    if ext and ext not in _ALLOWED_VIDEO_EXTENSIONS:
+        raise ValueError(f"Unsupported video format: {ext}")
+
+
+def parse_clip_moments(raw_response: str) -> list:
+    cleaned_json_string = raw_response.strip()
+    if cleaned_json_string.startswith("```json"):
+        cleaned_json_string = cleaned_json_string[len("```json"):].strip()
+    if cleaned_json_string.endswith("```"):
+        cleaned_json_string = cleaned_json_string[:-len("```")].strip()
+
+    try:
+        clip_moments = json.loads(cleaned_json_string)
+    except json.JSONDecodeError:
+        print("Error: Identified moments is not valid JSON")
+        return []
+
+    if not clip_moments or not isinstance(clip_moments, list):
+        print("Error: Identified moments is not a list")
+        return []
+
+    return clip_moments
+
+
+def _s3_object_exists(s3_client, bucket: str, key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3_client.exceptions.ClientError as exc:
+        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
+            return False
+        raise
+
+
+def download_video(s3_key: str, s3_client=None) -> tuple[pathlib.Path, pathlib.Path, object]:
+    validate_s3_key(s3_key)
+    client = s3_client or boto3.client("s3")
+    run_id = str(uuid.uuid4())
+    base_dir = pathlib.Path("/tmp") / run_id
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    video_path = base_dir / "input.mp4"
+    client.download_file("ai-podcast-clipper", s3_key, str(video_path))
+    return base_dir, video_path, client
+
 
 def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25):
     target_width = 1080
@@ -206,11 +256,16 @@ def create_subtitles_with_ffmpeg(transcript_segments: list, clip_start: float, c
     subprocess.run(ffmpeg_cmd, shell=True, check=True)
 
 
-def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list):
+def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list, s3_client=None):
     clip_name = f"clip_{clip_index}"
     s3_key_dir = os.path.dirname(s3_key)
     output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
     print(f"Output S3 key: {output_s3_key}")
+
+    client = s3_client or boto3.client("s3")
+    if _s3_object_exists(client, "ai-podcast-clipper", output_s3_key):
+        print(f"Output already exists for {output_s3_key}, skipping processing")
+        return {"output_s3_key": output_s3_key, "skipped": True}
 
     clip_dir = base_dir / clip_name
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -271,9 +326,9 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
     create_subtitles_with_ffmpeg(transcript_segments, start_time,
                                  end_time, vertical_mp4_path, subtitle_output_path, max_words=5)
 
-    s3_client = boto3.client("s3")
-    s3_client.upload_file(
+    client.upload_file(
         subtitle_output_path, "ai-podcast-clipper", output_s3_key)
+    return {"output_s3_key": output_s3_key, "skipped": False}
 
 
 class VideoProcessor:
@@ -373,15 +428,8 @@ class VideoProcessor:
     def process_video_action(self, s3_key: str) -> dict:
         self._ensure_models()
 
-        run_id = str(uuid.uuid4())
-        base_dir = pathlib.Path("/tmp") / run_id
-        base_dir.mkdir(parents=True, exist_ok=True)
-
         try:
-            # Download video file
-            video_path = base_dir / "input.mp4"
-            s3_client = boto3.client("s3")
-            s3_client.download_file("ai-podcast-clipper", s3_key, str(video_path))
+            base_dir, video_path, s3_client = download_video(s3_key)
 
             # 1. Transcription
             transcript_segments = self.transcribe_video(base_dir, video_path)
@@ -390,18 +438,7 @@ class VideoProcessor:
             print("Identifying clip moments")
             identified_moments_raw = self.identify_moments(transcript_segments)
 
-            cleaned_json_string = identified_moments_raw.strip()
-            if cleaned_json_string.startswith("```json"):
-                cleaned_json_string = cleaned_json_string[len("```json"):].strip()
-            if cleaned_json_string.endswith("```"):
-                cleaned_json_string = cleaned_json_string[:-len("```")].strip()
-
-            clip_moments = json.loads(cleaned_json_string)
-            if not clip_moments or not isinstance(clip_moments, list):
-                print("Error: Identified moments is not a list")
-                clip_moments = []
-
-            print(clip_moments)
+            clip_moments = parse_clip_moments(identified_moments_raw)
 
             # 3. Process clips
             for index, moment in enumerate(clip_moments[:5]):
@@ -409,10 +446,10 @@ class VideoProcessor:
                     print("Processing clip" + str(index) + " from " +
                           str(moment["start"]) + " to " + str(moment["end"]))
                     process_clip(base_dir, video_path, s3_key,
-                                 moment["start"], moment["end"], index, transcript_segments)
+                                 moment["start"], moment["end"], index, transcript_segments, s3_client=s3_client)
 
             return {"status": "completed", "clip_count": len(clip_moments[:5])}
         finally:
-            if base_dir.exists():
+            if "base_dir" in locals() and base_dir.exists():
                 print(f"Cleaning up temp dir after {base_dir}")
                 shutil.rmtree(base_dir, ignore_errors=True)

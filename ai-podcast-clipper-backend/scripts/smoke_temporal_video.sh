@@ -3,10 +3,10 @@ set -euo pipefail
 
 : "${TEMPORAL_ADDRESS:=127.0.0.1:7233}"
 : "${TEMPORAL_NAMESPACE:=clipper}"
-: "${TASK_QUEUE:=tq-video}"
+: "${TASK_QUEUE:=cpu-tq}"
 
 WF_TYPE="${1:-ProcessVideoWorkflow}"
-S3_KEY="file:///tmp/clipper-smoke/sample.mp4"
+S3_KEY="${2:-file:///tmp/clipper-smoke/sample.mp4}"
 WF_ID="smoke-video-$(date +%s)"
 
 echo "[smoke] address=$TEMPORAL_ADDRESS namespace=$TEMPORAL_NAMESPACE tq=$TASK_QUEUE type=$WF_TYPE id=$WF_ID s3_key=$S3_KEY"
