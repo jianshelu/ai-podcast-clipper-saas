@@ -14,10 +14,19 @@ import ffmpegcv
 from google import genai
 import numpy as np
 import pysubs2
+import torch
 from tqdm import tqdm
 import whisperx
 
 _ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".m4v"}
+
+
+def _local_path_from_key(s3_key: str) -> pathlib.Path | None:
+    if s3_key.startswith("file://"):
+        return pathlib.Path(s3_key[len("file://"):])
+    if os.path.isabs(s3_key):
+        return pathlib.Path(s3_key)
+    return None
 
 
 def validate_s3_key(s3_key: str) -> None:
@@ -58,12 +67,19 @@ def _s3_object_exists(s3_client, bucket: str, key: str) -> bool:
 
 def download_video(s3_key: str, s3_client=None) -> tuple[pathlib.Path, pathlib.Path, object]:
     validate_s3_key(s3_key)
-    client = s3_client or boto3.client("s3")
+    local_path = _local_path_from_key(s3_key)
     run_id = str(uuid.uuid4())
     base_dir = pathlib.Path("/tmp") / run_id
     base_dir.mkdir(parents=True, exist_ok=True)
 
     video_path = base_dir / "input.mp4"
+    if local_path:
+        if not local_path.exists():
+            raise FileNotFoundError(f"Local video not found: {local_path}")
+        shutil.copy(local_path, video_path)
+        return base_dir, video_path, None
+
+    client = s3_client or boto3.client("s3")
     client.download_file("ai-podcast-clipper", s3_key, str(video_path))
     return base_dir, video_path, client
 
@@ -258,14 +274,20 @@ def create_subtitles_with_ffmpeg(transcript_segments: list, clip_start: float, c
 
 def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list, s3_client=None):
     clip_name = f"clip_{clip_index}"
-    s3_key_dir = os.path.dirname(s3_key)
-    output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
+    local_path = _local_path_from_key(s3_key)
+    if local_path:
+        output_path = local_path.parent / f"{clip_name}.mp4"
+        output_s3_key = f"file://{output_path}"
+    else:
+        s3_key_dir = os.path.dirname(s3_key)
+        output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
     print(f"Output S3 key: {output_s3_key}")
 
-    client = s3_client or boto3.client("s3")
-    if _s3_object_exists(client, "ai-podcast-clipper", output_s3_key):
-        print(f"Output already exists for {output_s3_key}, skipping processing")
-        return {"output_s3_key": output_s3_key, "skipped": True}
+    if not local_path:
+        client = s3_client or boto3.client("s3")
+        if _s3_object_exists(client, "ai-podcast-clipper", output_s3_key):
+            print(f"Output already exists for {output_s3_key}, skipping processing")
+            return {"output_s3_key": output_s3_key, "skipped": True}
 
     clip_dir = base_dir / clip_name
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -326,8 +348,11 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
     create_subtitles_with_ffmpeg(transcript_segments, start_time,
                                  end_time, vertical_mp4_path, subtitle_output_path, max_words=5)
 
-    client.upload_file(
-        subtitle_output_path, "ai-podcast-clipper", output_s3_key)
+    if local_path:
+        shutil.copy(subtitle_output_path, output_path)
+    else:
+        client.upload_file(
+            subtitle_output_path, "ai-podcast-clipper", output_s3_key)
     return {"output_s3_key": output_s3_key, "skipped": False}
 
 
@@ -344,21 +369,83 @@ class VideoProcessor:
         if self.whisperx_model is not None:
             return
 
+        import torchaudio
+        if not hasattr(torchaudio, "AudioMetaData"):
+            try:
+                from torchaudio.backend.common import AudioMetaData as _AudioMetaData
+                torchaudio.AudioMetaData = _AudioMetaData
+            except Exception:
+                class AudioMetaData:
+                    def __init__(self, sample_rate, num_frames, num_channels, bits_per_sample, encoding):
+                        self.sample_rate = sample_rate
+                        self.num_frames = num_frames
+                        self.num_channels = num_channels
+                        self.bits_per_sample = bits_per_sample
+                        self.encoding = encoding
+
+                torchaudio.AudioMetaData = AudioMetaData
+
+        if not hasattr(torchaudio, "list_audio_backends"):
+            torchaudio.list_audio_backends = lambda: ["soundfile"]
+
+        if not hasattr(torchaudio, "info"):
+            try:
+                import soundfile as sf
+            except Exception:
+                def info(*_args, **_kwargs):
+                    raise RuntimeError("torchaudio.info is unavailable and soundfile is not installed.")
+            else:
+                def info(file, backend=None):
+                    with sf.SoundFile(file) as fh:
+                        return torchaudio.AudioMetaData(
+                            sample_rate=fh.samplerate,
+                            num_frames=len(fh),
+                            num_channels=fh.channels,
+                            bits_per_sample=0,
+                            encoding="UNKNOWN",
+                        )
+            torchaudio.info = info
+
         print("Loading models")
 
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if self.device == "cuda" else "int8"
+
+        try:
+            import typing
+            from omegaconf import DictConfig, ListConfig
+            from omegaconf.base import ContainerMetadata
+            torch.serialization.add_safe_globals([DictConfig, ListConfig, ContainerMetadata, typing.Any])
+        except Exception:
+            pass
+
+        if not getattr(torch, "_clipper_patched_load", False):
+            _orig_torch_load = torch.load
+
+            def _patched_torch_load(*args, **kwargs):
+                kwargs["weights_only"] = False
+                return _orig_torch_load(*args, **kwargs)
+
+            torch.load = _patched_torch_load
+            torch._clipper_patched_load = True
+
         self.whisperx_model = whisperx.load_model(
-            "large-v2", device="cuda", compute_type="float16")
+            "large-v2", device=self.device, compute_type=compute_type)
 
         self.alignment_model, self.metadata = whisperx.load_align_model(
             language_code="en",
-            device="cuda"
+            device=self.device
         )
 
         print("Transcription models loaded...")
 
-        print("Creating gemini client...")
-        self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-        print("Created gemini client...")
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if gemini_key:
+            print("Creating gemini client...")
+            self.gemini_client = genai.Client(api_key=gemini_key)
+            print("Created gemini client...")
+        else:
+            self.gemini_client = None
 
     def _ensure_models(self) -> None:
         if self.whisperx_model is None:
@@ -381,7 +468,7 @@ class VideoProcessor:
             self.alignment_model,
             self.metadata,
             audio,
-            device="cuda",
+            device=self.device,
             return_char_alignments=False
         )
 
@@ -401,6 +488,8 @@ class VideoProcessor:
         return segments
 
     def identify_moments(self, transcript: list):
+        if self.gemini_client is None:
+            return "[]"
         response = self.gemini_client.models.generate_content(model=self.gemini_model, contents="""
     This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 30 and maximum of 60 seconds long. The clip should never exceed 60 seconds.
 

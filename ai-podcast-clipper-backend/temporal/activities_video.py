@@ -12,8 +12,9 @@ _processor = None
 def _get_processor() -> VideoProcessor:
     global _processor
     if _processor is None:
-        _processor = VideoProcessor()
-        _processor.load_models()
+        processor = VideoProcessor()
+        processor.load_models()
+        _processor = processor
     return _processor
 
 
@@ -22,7 +23,10 @@ def _run_with_heartbeat(func, interval_seconds: int = 30):
 
     def _heartbeat_loop():
         while not stop_event.wait(interval_seconds):
-            activity.heartbeat("working")
+            try:
+                activity.heartbeat("working")
+            except RuntimeError:
+                break
 
     thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     thread.start()
