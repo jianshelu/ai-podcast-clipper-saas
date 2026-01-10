@@ -18,6 +18,7 @@ google-genai
 pysubs2
 boto3
 fastapi[standard]
+requests
 temporalio
 whisperx==3.7.2
 pyannote-audio==3.4.0
