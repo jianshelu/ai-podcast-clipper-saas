@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${TEMPORAL_ADDRESS:=127.0.0.1:7233}"
 : "${TEMPORAL_NAMESPACE:=clipper}"
-: "${TASK_QUEUE:=tq-cpu}"
+: "${TASK_QUEUE:=cpu-tq}"
 
 WF_TYPE="${1:-HelloWorkflow}"
 INPUT="${2:-\"ping\"}"

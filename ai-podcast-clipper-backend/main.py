@@ -65,7 +65,7 @@ def enqueue_video_workflow(s3_key: str) -> dict:
 
         address = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
         namespace = os.getenv("TEMPORAL_NAMESPACE", "clipper")
-        task_queue = os.getenv("TEMPORAL_TASK_QUEUE_VIDEO", "tq-video")
+        task_queue = os.getenv("TEMPORAL_TASK_QUEUE_CPU", "cpu-tq")
         workflow_id = f"video-{uuid.uuid4()}"
 
         client = await Client.connect(address, namespace=namespace)
