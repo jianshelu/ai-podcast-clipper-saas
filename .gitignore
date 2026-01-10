@@ -46,3 +46,11 @@ ai-podcast-clipper-backend/*.env
 ai-podcast-clipper-backend/.env
 ai-podcast-clipper-backend/.modal*
 ai-podcast-clipper-backend/brca1_analysis_plot.png
+# Python artifacts
+__pycache__/
+*.pyc
+<<<<<<< HEAD
+*.pyo
+*.pyd
+=======
+>>>>>>> fdc992e (chore: stop tracking python bytecode)
