@@ -13,8 +13,6 @@ import {
 } from "./ui/dropdown-menu";
 import { Avatar, AvatarFallback } from "./ui/avatar";
 import { signOut } from "next-auth/react";
-import { useEffect } from "react";
-import { toast } from "sonner";
 
 const NavHeader = ({ credits, email }: { credits: number; email: string }) => {
   return (

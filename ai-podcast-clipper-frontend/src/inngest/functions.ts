@@ -1,7 +1,7 @@
 import { env } from "~/env";
 import { inngest } from "./client";
 import { db } from "~/server/db";
-import { ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
+import { getStorage } from "~/storage";
 
 export const processVideo = inngest.createFunction(
   {
@@ -70,13 +70,14 @@ export const processVideo = inngest.createFunction(
         const { clipsFound } = await step.run(
           "create-clips-in-db",
           async () => {
-            const folderPrefix = s3Key.split("/")[0]!;
+            const jobPrefix = s3Key.startsWith("jobs/")
+              ? `${s3Key.split("/").slice(0, 2).join("/")}/`
+              : `${s3Key.split("/")[0]!}/`;
 
-            const allKeys = await listS3ObjectsByPrefix(folderPrefix);
+            const allKeys = await listObjectsByPrefix(jobPrefix);
 
             const clipKeys = allKeys.filter(
-              (key): key is string =>
-                key !== undefined && !key.endsWith("original.mp4"),
+              (key) => key.startsWith(`${jobPrefix}clips/`) && key.endsWith(".mp4"),
             );
 
             if (clipKeys.length > 0) {
@@ -128,7 +129,7 @@ export const processVideo = inngest.createFunction(
           });
         });
       }
-    } catch (error: unknown) {
+    } catch {
       await db.uploadedFile.update({
         where: {
           id: uploadedFileId,
@@ -141,20 +142,7 @@ export const processVideo = inngest.createFunction(
   },
 );
 
-async function listS3ObjectsByPrefix(prefix: string) {
-  const s3Client = new S3Client({
-    region: env.AWS_REGION,
-    credentials: {
-      accessKeyId: env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-    },
-  });
-
-  const listCommand = new ListObjectsV2Command({
-    Bucket: env.S3_BUCKET_NAME,
-    Prefix: prefix,
-  });
-
-  const response = await s3Client.send(listCommand);
-  return response.Contents?.map((item) => item.Key).filter(Boolean) ?? [];
+async function listObjectsByPrefix(prefix: string) {
+  const storage = getStorage();
+  return storage.listKeysByPrefix(prefix);
 }

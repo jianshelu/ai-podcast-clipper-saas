@@ -1,12 +1,10 @@
 "use server";
 
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { revalidatePath } from "next/cache";
-import { env } from "~/env";
 import { inngest } from "~/inngest/client";
 import { auth } from "~/server/auth";
 import { db } from "~/server/db";
+import { getStorage } from "~/storage";
 
 export async function processVideo(uploadedFileId: string) {
   const uploadedVideo = await db.uploadedFile.findUniqueOrThrow({
@@ -54,26 +52,42 @@ export async function getClipPlayUrl(
         userId: session.user.id,
       },
     });
-
-    const s3Client = new S3Client({
-      region: env.AWS_REGION,
-      credentials: {
-        accessKeyId: env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      },
-    });
-
-    const command = new GetObjectCommand({
-      Bucket: env.S3_BUCKET_NAME,
-      Key: clip.s3Key,
-    });
-
-    const signedUrl = await getSignedUrl(s3Client, command, {
-      expiresIn: 3600,
+    const storage = getStorage();
+    const signedUrl = await storage.getPresignedGetUrl({
+      key: clip.s3Key,
     });
 
     return { succes: true, url: signedUrl };
-  } catch (error) {
+  } catch {
     return { succes: false, error: "Failed to generate play URL." };
+  }
+}
+
+export async function getClipDownloadUrl(
+  clipId: string,
+): Promise<{ succes: boolean; url?: string; error?: string }> {
+  const session = await auth();
+  if (!session?.user?.id) {
+    return { succes: false, error: "Unauthorized" };
+  }
+
+  try {
+    const clip = await db.clip.findUniqueOrThrow({
+      where: {
+        id: clipId,
+        userId: session.user.id,
+      },
+    });
+
+    const filename = clip.s3Key.split("/").pop() ?? `clip-${clip.id}.mp4`;
+    const storage = getStorage();
+    const signedUrl = await storage.getPresignedGetUrl({
+      key: clip.s3Key,
+      filename,
+    });
+
+    return { succes: true, url: signedUrl };
+  } catch {
+    return { succes: false, error: "Failed to generate download URL." };
   }
 }

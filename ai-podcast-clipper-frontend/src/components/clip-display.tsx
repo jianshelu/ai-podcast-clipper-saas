@@ -3,7 +3,7 @@
 import type { Clip } from "@prisma/client";
 import { Download, Loader2, Play } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getClipPlayUrl } from "~/actions/generation";
+import { getClipDownloadUrl, getClipPlayUrl } from "~/actions/generation";
 import { Button } from "./ui/button";
 
 function ClipCard({ clip }: { clip: Clip }) {
@@ -19,7 +19,7 @@ function ClipCard({ clip }: { clip: Clip }) {
         } else if (result.error) {
           console.error("Failed to get play url: " + result.error);
         }
-      } catch (error) {
+      } catch {
       } finally {
         setIsLoadingUrl(false);
       }
@@ -28,14 +28,20 @@ function ClipCard({ clip }: { clip: Clip }) {
     void fetchPlayUrl();
   }, [clip.id]);
 
-  const handleDownload = () => {
-    if (playUrl) {
+  const handleDownload = async () => {
+    try {
+      const result = await getClipDownloadUrl(clip.id);
+      if (!result.succes || !result.url) {
+        throw new Error(result.error ?? "Failed to get download URL.");
+      }
       const link = document.createElement("a");
-      link.href = playUrl;
+      link.href = result.url;
       link.style.display = "none";
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
+    } catch (error) {
+      console.error(error);
     }
   };
 

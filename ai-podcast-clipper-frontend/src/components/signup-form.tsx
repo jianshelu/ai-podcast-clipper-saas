@@ -11,7 +11,6 @@ import {
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Button } from "./ui/button";
-import { z } from "zod";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useState } from "react";
@@ -59,7 +58,7 @@ export function SignupForm({
       } else {
         router.push("/dashboard");
       }
-    } catch (error) {
+    } catch {
       setError("An unexpected error occured");
     } finally {
       setIsSubmitting(false);
