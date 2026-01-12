@@ -18,6 +18,28 @@ def _get_processor() -> VideoProcessor:
     return _processor
 
 
+def _fallback_clip_moments(transcript_segments: list, min_seconds: float = 30.0, max_seconds: float = 60.0) -> list:
+    if not transcript_segments:
+        return []
+    start = transcript_segments[0].get("start") or 0.0
+    target_min = start + min_seconds
+    target_max = start + max_seconds
+    end = None
+    for segment in transcript_segments:
+        seg_end = segment.get("end")
+        if seg_end is None:
+            continue
+        if seg_end <= target_max:
+            end = seg_end
+        if target_min <= seg_end <= target_max:
+            end = seg_end
+    if end is None:
+        end = transcript_segments[-1].get("end", start)
+    if end <= start:
+        return []
+    return [{"start": start, "end": end}]
+
+
 def _run_with_heartbeat(func, interval_seconds: int = 30):
     stop_event = threading.Event()
 
@@ -60,7 +82,11 @@ def transcribe_activity(s3_key: str) -> list:
 def highlight_activity(transcript_segments: list) -> list:
     processor = _get_processor()
     identified_moments_raw = processor.identify_moments(transcript_segments)
-    return parse_clip_moments(identified_moments_raw)
+    clip_moments = parse_clip_moments(identified_moments_raw)
+    if not clip_moments:
+        print("No clip moments from LLM; using fallback clip window.")
+        clip_moments = _fallback_clip_moments(transcript_segments)
+    return clip_moments
 
 
 @activity.defn
