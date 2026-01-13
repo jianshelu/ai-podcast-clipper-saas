@@ -121,7 +121,8 @@ def _call_local_llm(prompt: str) -> str:
         return "[]"
     model = os.getenv("LOCAL_LLM_MODEL", "local-llama")
     api_key = os.getenv("LOCAL_LLM_API_KEY", "local")
-    timeout = float(os.getenv("LOCAL_LLM_TIMEOUT", "120"))
+    timeout = float(os.getenv("LOCAL_LLM_TIMEOUT", "300"))
+    stream = os.getenv("LOCAL_LLM_STREAM", "true").lower() in ("1", "true", "yes")
     url = f"{base_url}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -131,12 +132,39 @@ def _call_local_llm(prompt: str) -> str:
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
+        "stream": stream,
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
         if not response.ok:
             print(f"Local LLM error: status={response.status_code} body={response.text[:500]}")
             return "[]"
+
+        if stream:
+            content_parts = []
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if "content" in delta:
+                            content = delta["content"]
+                            if isinstance(content, str):
+                                content_parts.append(content)
+                            elif isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, str):
+                                        content_parts.append(part)
+                            # ignore None or other types
+                    except Exception:
+                        continue
+            return "".join(content_parts) or "[]"
+
         data = response.json()
         return data["choices"][0]["message"]["content"]
     except Exception as exc:
@@ -490,6 +518,8 @@ class VideoProcessor:
         if self.whisperx_model is not None:
             return
 
+        total_start = time.time()
+
         import torchaudio
         if not hasattr(torchaudio, "AudioMetaData"):
             try:
@@ -550,13 +580,19 @@ class VideoProcessor:
             torch.load = _patched_torch_load
             torch._clipper_patched_load = True
 
+        model_start = time.time()
         self.whisperx_model = whisperx.load_model(
             self.whisperx_model_name, device=self.device, compute_type=compute_type)
+        whisper_load_time = time.time() - model_start
+        print(f"WhisperX model loaded in {whisper_load_time:.2f} seconds (device={self.device})")
 
+        align_start = time.time()
         self.alignment_model, self.metadata = whisperx.load_align_model(
             language_code="en",
             device=self.device
         )
+        align_load_time = time.time() - align_start
+        print(f"Alignment model loaded in {align_load_time:.2f} seconds")
 
         print("Transcription models loaded...")
 
@@ -568,22 +604,35 @@ class VideoProcessor:
         else:
             self.gemini_client = None
 
+        total_time = time.time() - total_start
+        print(f"Model initialization completed in {total_time:.2f} seconds")
+
     def _ensure_models(self) -> None:
         if self.whisperx_model is None:
             self.load_models()
 
     def transcribe_video(self, base_dir: pathlib.Path, video_path: pathlib.Path) -> list:
         audio_path = base_dir / "audio.wav"
+        extract_start = time.time()
         extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
         subprocess.run(extract_cmd, shell=True,
                        check=True, capture_output=True)
+        print(f"Audio extraction took {time.time() - extract_start:.2f} seconds")
 
         print("Starting transcription with WhisperX...")
         start_time = time.time()
 
         audio = whisperx.load_audio(str(audio_path))
-        result = self.whisperx_model.transcribe(audio, batch_size=16)
+        transcribe_start = time.time()
+        disable_vad = os.getenv("WHISPERX_DISABLE_VAD", "").lower() in ("1", "true", "yes")
+        try:
+            result = self.whisperx_model.transcribe(audio, batch_size=16, vad=not disable_vad)
+        except TypeError:
+            # Fallback for older whisperx versions without vad kwarg
+            result = self.whisperx_model.transcribe(audio, batch_size=16)
+        transcribe_time = time.time() - transcribe_start
 
+        align_start = time.time()
         result = whisperx.align(
             result["segments"],
             self.alignment_model,
@@ -592,9 +641,10 @@ class VideoProcessor:
             device=self.device,
             return_char_alignments=False
         )
+        align_time = time.time() - align_start
 
         duration = time.time() - start_time
-        print("Transcription and alignment took " + str(duration) + " seconds")
+        print(f"Transcription took {transcribe_time:.2f} seconds; alignment took {align_time:.2f} seconds; total {duration:.2f} seconds")
 
         segments = []
 
@@ -614,34 +664,29 @@ class VideoProcessor:
         if len(transcript_text) > max_chars:
             transcript_text = transcript_text[:max_chars]
         prompt = """
-    This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 30 and maximum of 60 seconds long. The clip should never exceed 60 seconds.
+Find 1-3 meaningful clips (stories, Q&A) from the transcript between 30 and 60 seconds long. Do NOT return word-level or sub-second spans. If you cannot find valid clips, return [].
 
-    Your task is to find and extract stories, or question and their corresponding answers from the transcript.
-    Each clip should begin with the question and conclude with the answer.
-    It is acceptable for the clip to include a few additional sentences before a question if it aids in contextualizing the question.
+Rules:
+- Use only provided timestamps; do not fabricate or adjust them.
+- Clips must be 30-60 seconds inclusive, non-overlapping, and start/end on sentence boundaries.
+- Output JSON readable by json.loads, e.g. [{"start": 12.3, "end": 55.7}, {"start": ...}].
+- If unsure, prefer a single ~45-60s clip spanning a coherent segment.
 
-    Please adhere to the following rules:
-    - Ensure that clips do not overlap with one another.
-    - Start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
-    - Only use the start and end timestamps provided in the input. modifying timestamps is not allowed.
-    - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{"start": seconds, "end": seconds}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
-    - Aim to generate longer clips between 40-60 seconds, and ensure to include as much content from the context as viable.
+Avoid greetings, fillers, and goodbyes.
 
-    Avoid including:
-    - Moments of greeting, thanking, or saying goodbye.
-    - Non-question and answer interactions.
-
-    If there are no valid clips to extract, the output should be an empty list [], in JSON format. Also readable by json.loads() in Python.
-
-    The transcript is as follows:\n\n""" + transcript_text
+Transcript:\n\n""" + transcript_text
         if self.gemini_client is not None:
+            llm_start = time.time()
             response = self.gemini_client.models.generate_content(
                 model=self.gemini_model,
                 contents=prompt,
             )
+            print(f"Identify moments via Gemini took {time.time() - llm_start:.2f} seconds")
             print(f"Identified moments response: ${response.text}")
             return response.text
+        llm_start = time.time()
         local_response = _call_local_llm(prompt)
+        print(f"Identify moments via local LLM took {time.time() - llm_start:.2f} seconds")
         print(f"Identified moments response: {local_response}")
         return local_response
 
@@ -659,6 +704,17 @@ class VideoProcessor:
             identified_moments_raw = self.identify_moments(transcript_segments)
 
             clip_moments = parse_clip_moments(identified_moments_raw)
+            filtered = []
+            for m in clip_moments or []:
+                try:
+                    start = float(m.get("start", 0))
+                    end = float(m.get("end", 0))
+                    dur = end - start
+                    if 30.0 <= dur <= 60.0:
+                        filtered.append({"start": start, "end": end})
+                except Exception:
+                    continue
+            clip_moments = filtered
             if not clip_moments:
                 clip_moments = _fallback_clip_moments(transcript_segments)
 
