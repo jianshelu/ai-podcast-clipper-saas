@@ -97,6 +97,16 @@ def main() -> int:
     parser.add_argument("--job-id", default=str(uuid.uuid4()), help="Job id to use")
     parser.add_argument("--expires", type=int, default=600, help="Presign expiration seconds")
     parser.add_argument(
+        "--input-prefix",
+        default="jobs/{job_id}/inputs",
+        help="Prefix for uploaded inputs (default: jobs/{job_id}/inputs)",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        default="jobs/{job_id}/outputs",
+        help="Prefix for copied outputs (default: jobs/{job_id}/outputs)",
+    )
+    parser.add_argument(
         "--backend",
         choices=("oss", "s3"),
         default=os.getenv("OSS_BACKEND", "oss"),
@@ -174,17 +184,26 @@ def main() -> int:
         )
 
     ext = file_path.suffix or ".bin"
-    object_key = f"jobs/{args.job_id}/inputs/original{ext}"
+    input_prefix = args.input_prefix.format(job_id=args.job_id).rstrip("/")
+    output_prefix = args.output_prefix.format(job_id=args.job_id).rstrip("/")
+    input_key = f"{input_prefix}/original{ext}"
+    output_key = f"{output_prefix}/original{ext}"
     filename = file_path.name
 
-    put_url = presign_put(object_key)
-    print(f"[put] key={object_key}")
+    put_url = presign_put(input_key)
+    print(f"[put] key={input_key}")
     with file_path.open("rb") as handle:
         put_response = requests.put(put_url, data=handle)
     _check_response(put_response, "PUT")
 
-    get_url = presign_get(object_key, filename)
-    print("[get] download and hash check")
+    print(f"[copy] {input_key} -> {output_key}")
+    if args.backend == "oss":
+        bucket.copy_object(bucket.bucket_name, input_key, output_key)
+    else:
+        client.copy({"Bucket": bucket_name, "Key": input_key}, bucket_name, output_key)
+
+    get_url = presign_get(output_key, filename)
+    print("[get] download and hash check (from outputs)")
     with requests.get(get_url, stream=True) as get_response:
         _check_response(get_response, "GET")
         download_hash = _sha256_stream(get_response)
