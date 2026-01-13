@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import json
 import os
 import pathlib
@@ -9,7 +10,6 @@ import sys
 import time
 import uuid
 
-import boto3
 import cv2
 import ffmpegcv
 from google import genai
@@ -20,6 +20,8 @@ import torch
 from tqdm import tqdm
 import whisperx
 from botocore.config import Config
+
+from storage import get_storage
 
 _ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".m4v"}
 
@@ -58,14 +60,72 @@ def parse_clip_moments(raw_response: str) -> list:
     return clip_moments
 
 
-def _s3_object_exists(s3_client, bucket: str, key: str) -> bool:
-    try:
-        s3_client.head_object(Bucket=bucket, Key=key)
-        return True
-    except s3_client.exceptions.ClientError as exc:
-        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
-            return False
-        raise
+def _object_exists(storage, key: str) -> bool:
+    return storage.head(key)
+
+
+def _job_id_from_key(object_key: str) -> str | None:
+    parts = object_key.split("/")
+    if len(parts) >= 2 and parts[0] == "jobs":
+        return parts[1]
+    return None
+
+
+def _build_clip_key(input_key: str, clip_name: str) -> str:
+    job_id = _job_id_from_key(input_key)
+    if not job_id:
+        parent = os.path.dirname(input_key)
+        return f"{parent}/{clip_name}.mp4"
+    return f"jobs/{job_id}/clips/{clip_name}.mp4"
+
+
+def _build_transcript_key(input_key: str) -> str:
+    job_id = _job_id_from_key(input_key)
+    if not job_id:
+        parent = os.path.dirname(input_key)
+        return f"{parent}/transcript.json"
+    return f"jobs/{job_id}/transcripts/transcript.json"
+
+
+def _build_plan_key(input_key: str) -> str:
+    job_id = _job_id_from_key(input_key)
+    if not job_id:
+        parent = os.path.dirname(input_key)
+        return f"{parent}/clip_plan.json"
+    return f"jobs/{job_id}/plans/clip_plan.json"
+
+
+def _local_clip_upload_key(input_key: str, clip_name: str) -> str:
+    prefix = os.getenv("LOCAL_UPLOAD_PREFIX", "jobs/local")
+    job_id = os.getenv("LOCAL_UPLOAD_JOB_ID")
+    if not job_id:
+        digest = hashlib.sha256(input_key.encode("utf-8")).hexdigest()[:12]
+        job_id = f"local-{digest}"
+    return f"{prefix}/{job_id}/clips/{clip_name}.mp4"
+
+
+def _oss_configured() -> bool:
+    return all(
+        os.getenv(name)
+        for name in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET", "OSS_ENDPOINT", "OSS_BUCKET")
+    )
+
+
+def _columbia_job_id(input_key: str) -> str:
+    job_id = _job_id_from_key(input_key)
+    if job_id:
+        return job_id
+    override = os.getenv("LOCAL_UPLOAD_JOB_ID")
+    if override:
+        return override
+    digest = hashlib.sha256(input_key.encode("utf-8")).hexdigest()[:12]
+    return f"local-{digest}"
+
+
+def _columbia_key(input_key: str, filename: str) -> str:
+    prefix = os.getenv("COLUMBIA_PREFIX", "columbia")
+    job_id = _columbia_job_id(input_key)
+    return f"{prefix}/{job_id}/{filename}"
 
 
 def _get_s3_bucket() -> str:
@@ -399,10 +459,11 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
     if local_path:
         output_path = local_path.parent / f"{clip_name}.mp4"
         output_s3_key = f"file://{output_path}"
+        if upload_local_clips:
+            output_s3_key = _local_clip_upload_key(s3_key, clip_name)
     else:
-        s3_key_dir = os.path.dirname(s3_key)
-        output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
-    print(f"Output S3 key: {output_s3_key}")
+        output_s3_key = _build_clip_key(s3_key, clip_name)
+    print(f"Output object key: {output_s3_key}")
 
     if not local_path:
         client = s3_client or _get_s3_client()
@@ -435,6 +496,13 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
     extract_cmd = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
     subprocess.run(extract_cmd, shell=True,
                    check=True, capture_output=True)
+
+    if not list(pyframes_path.glob("*.jpg")):
+        frame_extract_cmd = (
+            f"ffmpeg -y -i {clip_segment_path} -vf fps=25 -q:v 2 "
+            f"{pyframes_path}/%06d.jpg"
+        )
+        subprocess.run(frame_extract_cmd, shell=True, check=True, text=True)
 
     shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
 
@@ -497,6 +565,9 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
 
     if local_path:
         shutil.copy(subtitle_output_path, output_path)
+        if upload_local_clips:
+            client = s3_client or get_storage()
+            client.upload(str(subtitle_output_path), output_s3_key)
     else:
         bucket = _get_s3_bucket()
         client.upload_file(
@@ -559,8 +630,8 @@ class VideoProcessor:
 
         print("Loading models")
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if self.device == "cuda" else "int8"
+        self.device = "cpu"
+        compute_type = "int8"
 
         try:
             import typing
@@ -692,12 +763,19 @@ Transcript:\n\n""" + transcript_text
 
     def process_video_action(self, s3_key: str) -> dict:
         self._ensure_models()
+        success = False
 
         try:
             base_dir, video_path, s3_client = download_video(s3_key)
 
             # 1. Transcription
             transcript_segments = self.transcribe_video(base_dir, video_path)
+            if not _local_path_from_key(s3_key):
+                transcript_key = _build_transcript_key(s3_key)
+                transcript_path = base_dir / "transcript.json"
+                with open(transcript_path, "w", encoding="utf-8") as handle:
+                    json.dump(transcript_segments, handle)
+                s3_client.upload(str(transcript_path), transcript_key)
 
             # 2. Identify moments for clips
             print("Identifying clip moments")
@@ -726,8 +804,12 @@ Transcript:\n\n""" + transcript_text
                     process_clip(base_dir, video_path, s3_key,
                                  moment["start"], moment["end"], index, transcript_segments, s3_client=s3_client)
 
+            success = True
             return {"status": "completed", "clip_count": len(clip_moments[:5])}
         finally:
             if "base_dir" in locals() and base_dir.exists():
-                print(f"Cleaning up temp dir after {base_dir}")
-                shutil.rmtree(base_dir, ignore_errors=True)
+                if success:
+                    print(f"Cleaning up temp dir after {base_dir}")
+                    shutil.rmtree(base_dir, ignore_errors=True)
+                else:
+                    print(f"Keeping temp dir for inspection: {base_dir}")

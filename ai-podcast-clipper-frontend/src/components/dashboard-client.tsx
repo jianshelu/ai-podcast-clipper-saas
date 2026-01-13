@@ -1,6 +1,5 @@
 "use client";
 
-import Dropzone, { type DropzoneState } from "shadcn-dropzone";
 import type { Clip } from "@prisma/client";
 import Link from "next/link";
 import { Button } from "./ui/button";
@@ -13,7 +12,7 @@ import {
   CardTitle,
 } from "./ui/card";
 import { Loader2, UploadCloud } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { generateUploadUrl } from "~/actions/s3";
 import { toast } from "sonner";
 import { processVideo } from "~/actions/generation";
@@ -47,6 +46,8 @@ export function DashboardClient({
   const [uploading, setUploading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const router = useRouter();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const maxBytes = 500 * 1024 * 1024;
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -54,8 +55,25 @@ export function DashboardClient({
     setTimeout(() => setRefreshing(false), 600);
   };
 
-  const handleDrop = (acceptedFiles: File[]) => {
-    setFiles(acceptedFiles);
+  const handleFilesSelected = (selectedFiles: File[]) => {
+    const file = selectedFiles[0];
+    if (!file) {
+      setFiles([]);
+      return;
+    }
+    if (file.type !== "video/mp4") {
+      toast.error("Unsupported file type", {
+        description: "Please upload an MP4 file.",
+      });
+      return;
+    }
+    if (file.size > maxBytes) {
+      toast.error("File too large", {
+        description: "Please upload a file smaller than 500MB.",
+      });
+      return;
+    }
+    setFiles([file]);
   };
 
   const handleUpload = async () => {
@@ -92,7 +110,7 @@ export function DashboardClient({
           "Your video has been scheduled for processing. Check the status below.",
         duration: 5000,
       });
-    } catch (error) {
+    } catch {
       toast.error("Upload failed", {
         description:
           "There was a problem uploading your video. Please try again.",
@@ -133,33 +151,52 @@ export function DashboardClient({
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <Dropzone
-                onDrop={handleDrop}
-                accept={{ "video/mp4": [".mp4"] }}
-                maxSize={500 * 1024 * 1024}
-                disabled={uploading}
-                maxFiles={1}
+              <div
+                className="flex flex-col items-center justify-center space-y-4 rounded-lg border border-dashed p-10 text-center"
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  if (uploading) return;
+                  handleFilesSelected(Array.from(event.dataTransfer.files));
+                }}
+                onClick={() => {
+                  if (!uploading) fileInputRef.current?.click();
+                }}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    if (!uploading) fileInputRef.current?.click();
+                  }
+                }}
               >
-                {(dropzone: DropzoneState) => (
-                  <>
-                    <div className="flex flex-col items-center justify-center space-y-4 rounded-lg p-10 text-center">
-                      <UploadCloud className="text-muted-foreground h-12 w-12" />
-                      <p className="font-medium">Drag and drop your file</p>
-                      <p className="text-muted-foreground text-sm">
-                        or click to browse (MP4 up to 500MB)
-                      </p>
-                      <Button
-                        className="cursor-pointer"
-                        variant="default"
-                        size="sm"
-                        disabled={uploading}
-                      >
-                        Select File
-                      </Button>
-                    </div>
-                  </>
-                )}
-              </Dropzone>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".mp4,video/mp4"
+                  className="hidden"
+                  onChange={(event) => {
+                    if (!event.target.files) return;
+                    handleFilesSelected(Array.from(event.target.files));
+                    event.target.value = "";
+                  }}
+                />
+                <UploadCloud className="text-muted-foreground h-12 w-12" />
+                <p className="font-medium">Drag and drop your file</p>
+                <p className="text-muted-foreground text-sm">
+                  or click to browse (MP4 up to 500MB)
+                </p>
+                <Button
+                  className="cursor-pointer"
+                  variant="default"
+                  size="sm"
+                  disabled={uploading}
+                  type="button"
+                >
+                  Select File
+                </Button>
+              </div>
 
               <div className="mt-2 flex items-start justify-between">
                 <div>
