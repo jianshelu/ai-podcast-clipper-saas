@@ -6,6 +6,7 @@ import pathlib
 import pickle
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 
@@ -14,9 +15,11 @@ import ffmpegcv
 from google import genai
 import numpy as np
 import pysubs2
+import requests
 import torch
 from tqdm import tqdm
 import whisperx
+from botocore.config import Config
 
 from storage import get_storage
 
@@ -125,6 +128,110 @@ def _columbia_key(input_key: str, filename: str) -> str:
     return f"{prefix}/{job_id}/{filename}"
 
 
+def _get_s3_bucket() -> str:
+    return os.getenv("OSS_BUCKET", "ai-podcast-clipper")
+
+
+def _fallback_clip_moments(transcript_segments: list, min_seconds: float = 30.0, max_seconds: float = 60.0) -> list:
+    if not transcript_segments:
+        return []
+    start = transcript_segments[0].get("start") or 0.0
+    target_min = start + min_seconds
+    target_max = start + max_seconds
+    end = None
+    for segment in transcript_segments:
+        seg_end = segment.get("end")
+        if seg_end is None:
+            continue
+        if seg_end <= target_max:
+            end = seg_end
+        if target_min <= seg_end <= target_max:
+            end = seg_end
+    if end is None:
+        end = transcript_segments[-1].get("end", start)
+    if end <= start:
+        return []
+    return [{"start": start, "end": end}]
+
+
+def _get_s3_client():
+    endpoint = os.getenv("OSS_ENDPOINT")
+    access_key_id = os.getenv("OSS_ACCESS_KEY_ID")
+    access_key_secret = os.getenv("OSS_ACCESS_KEY_SECRET")
+    path_style = os.getenv("OSS_PATH_STYLE", "").lower() in ("1", "true", "yes")
+    region = os.getenv("OSS_REGION", "us-east-1")
+    signature_version = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
+    config = Config(
+        signature_version=signature_version,
+        s3={"addressing_style": "path" if path_style else "virtual"},
+    )
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name=region,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=access_key_secret,
+        config=config,
+    )
+
+
+def _call_local_llm(prompt: str) -> str:
+    base_url = os.getenv("LOCAL_LLM_BASE_URL", "").rstrip("/")
+    if not base_url:
+        return "[]"
+    model = os.getenv("LOCAL_LLM_MODEL", "local-llama")
+    api_key = os.getenv("LOCAL_LLM_API_KEY", "local")
+    timeout = float(os.getenv("LOCAL_LLM_TIMEOUT", "300"))
+    stream = os.getenv("LOCAL_LLM_STREAM", "true").lower() in ("1", "true", "yes")
+    url = f"{base_url}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "stream": stream,
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
+        if not response.ok:
+            print(f"Local LLM error: status={response.status_code} body={response.text[:500]}")
+            return "[]"
+
+        if stream:
+            content_parts = []
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if "content" in delta:
+                            content = delta["content"]
+                            if isinstance(content, str):
+                                content_parts.append(content)
+                            elif isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, str):
+                                        content_parts.append(part)
+                            # ignore None or other types
+                    except Exception:
+                        continue
+            return "".join(content_parts) or "[]"
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        print(f"Local LLM request failed: {exc}")
+        return "[]"
+
+
 def download_video(s3_key: str, s3_client=None) -> tuple[pathlib.Path, pathlib.Path, object]:
     validate_s3_key(s3_key)
     local_path = _local_path_from_key(s3_key)
@@ -139,9 +246,10 @@ def download_video(s3_key: str, s3_client=None) -> tuple[pathlib.Path, pathlib.P
         shutil.copy(local_path, video_path)
         return base_dir, video_path, None
 
-    storage = s3_client or get_storage()
-    storage.download(s3_key, str(video_path))
-    return base_dir, video_path, storage
+    client = s3_client or _get_s3_client()
+    bucket = _get_s3_bucket()
+    client.download_file(bucket, s3_key, str(video_path))
+    return base_dir, video_path, client
 
 
 def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25):
@@ -150,6 +258,7 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
 
     flist = glob.glob(os.path.join(pyframes_path, "*.jpg"))
     flist.sort()
+    print(f"[vertical] frames={len(flist)} path={pyframes_path}")
 
     faces = [[] for _ in range(len(flist))]
 
@@ -168,6 +277,7 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
     temp_video_path = os.path.join(pyavi_path, "video_only.mp4")
 
     vout = None
+    use_gpu_writer = torch.cuda.is_available()
     for fidx, fname in tqdm(enumerate(flist), total=len(flist), desc="Creating vertical video"):
         img = cv2.imread(fname)
         if img is None:
@@ -182,18 +292,18 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
             max_score_face = None
 
         if vout is None:
-            try:
+            if use_gpu_writer:
                 vout = ffmpegcv.VideoWriterNV(
                     file=temp_video_path,
                     codec=None,
                     fps=framerate,
-                    resize=(target_width, target_height)
+                    resize=(target_width, target_height),
+                    gpu=0,
                 )
-            except RuntimeError as exc:
-                print(f"[video] NVENC unavailable, falling back to CPU writer: {exc}")
+            else:
                 vout = ffmpegcv.VideoWriter(
                     file=temp_video_path,
-                    codec="libx264",
+                    codec=None,
                     fps=framerate,
                     resize=(target_width, target_height),
                 )
@@ -344,8 +454,8 @@ def create_subtitles_with_ffmpeg(transcript_segments: list, clip_start: float, c
 def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list, s3_client=None):
     clip_name = f"clip_{clip_index}"
     local_path = _local_path_from_key(s3_key)
-    upload_local_clips = os.getenv("OSS_UPLOAD_LOCAL_CLIPS", "").lower() in ("1", "true", "yes")
-    use_oss = _oss_configured()
+    force_reprocess = os.getenv("FORCE_REPROCESS", "").lower() in ("1", "true", "yes")
+    skip_render = os.getenv("SKIP_RENDER", "").lower() in ("1", "true", "yes")
     if local_path:
         output_path = local_path.parent / f"{clip_name}.mp4"
         output_s3_key = f"file://{output_path}"
@@ -356,8 +466,9 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
     print(f"Output object key: {output_s3_key}")
 
     if not local_path:
-        client = s3_client or get_storage()
-        if _object_exists(client, output_s3_key):
+        client = s3_client or _get_s3_client()
+        bucket = _get_s3_bucket()
+        if _s3_object_exists(client, bucket, output_s3_key) and not force_reprocess:
             print(f"Output already exists for {output_s3_key}, skipping processing")
             return {"output_s3_key": output_s3_key, "skipped": True}
 
@@ -395,136 +506,51 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
 
     shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
 
-    columbia_script = os.getenv("COLUMBIA_SCRIPT_PATH")
-    if columbia_script:
-        columbia_script_path = pathlib.Path(columbia_script).expanduser().resolve()
-    else:
-        columbia_script_path = pathlib.Path(__file__).resolve().parent / "scripts" / "columbia_test.py"
+    if skip_render:
+        print("SKIP_RENDER set; uploading raw clip segment without vertical/subtitles.")
+        if local_path:
+            shutil.copy(clip_segment_path, output_path)
+        else:
+            bucket = _get_s3_bucket()
+            client.upload_file(str(clip_segment_path), bucket, output_s3_key)
+        return {"output_s3_key": output_s3_key, "skipped": False, "rendered": "raw"}
 
-    pywork_dir = clip_dir / "pywork"
-    tracks_path = pywork_dir / "tracks.pckl"
-    scores_path = pywork_dir / "scores.pckl"
-    faces_path = pywork_dir / "faces.pckl"
-
-    if columbia_script_path.exists():
-        columbia_command = [
-            "python",
-            str(columbia_script_path),
-            "--video",
-            str(clip_segment_path),
-            "--workdir",
-            str(clip_dir),
-            "--pywork-dir",
-            str(pywork_dir),
-        ]
-        print(
-            "[columbia] env "
-            f"run_local_llm={os.getenv('COLUMBIA_RUN_LOCAL_LLM')} "
-            f"run_whispervideo={os.getenv('COLUMBIA_RUN_WHISPERVIDEO')} "
-            f"export_json={os.getenv('COLUMBIA_EXPORT_JSON')}"
+    skip_face_detection = os.getenv("SKIP_FACE_DETECTION", "").lower() in ("1", "true", "yes")
+    if skip_face_detection:
+        print("Skipping face detection/Columbia; rendering with resize mode only.")
+        frame_extract_cmd = (
+            f"ffmpeg -y -i {clip_segment_path} -qscale:v 2 -r 25 "
+            f"{pyframes_path}/%06d.jpg"
         )
-        if os.getenv("COLUMBIA_RUN_LOCAL_LLM", "").lower() in ("1", "true", "yes"):
-            columbia_command.append("--run_local_llm")
-            llm_endpoint = os.getenv("COLUMBIA_LLM_ENDPOINT") or os.getenv("LLM_ENDPOINT")
-            llm_model = os.getenv("COLUMBIA_LLM_MODEL") or os.getenv("LLM_MODEL")
-            llm_prompt = os.getenv("COLUMBIA_LLM_PROMPT") or os.getenv("LLM_PROMPT")
-            llm_timeout = os.getenv("COLUMBIA_LLM_TIMEOUT") or os.getenv("LLM_TIMEOUT")
-            if llm_endpoint:
-                columbia_command.extend(["--llm-endpoint", llm_endpoint])
-            if llm_model:
-                columbia_command.extend(["--llm-model", llm_model])
-            if llm_prompt:
-                columbia_command.extend(["--llm-prompt", llm_prompt])
-            if llm_timeout:
-                columbia_command.extend(["--llm-timeout", llm_timeout])
-        if os.getenv("COLUMBIA_RUN_WHISPERVIDEO", "").lower() in ("1", "true", "yes"):
-            columbia_command.append("--run_whispervideo")
-        if os.getenv("COLUMBIA_EXPORT_JSON", "").lower() in ("1", "true", "yes"):
-            columbia_command.append("--export-json")
+        subprocess.run(frame_extract_cmd, shell=True, check=True, capture_output=True, text=True)
+        tracks = []
+        scores = []
+    else:
+        columbia_root = pathlib.Path(__file__).resolve().parents[1] / "third_party" / "LR-ASD"
+        columbia_script = columbia_root / "Columbia_test.py"
+        columbia_command = (
+            f"{sys.executable} {columbia_script} "
+            f"--videoName {clip_name} "
+            f"--videoFolder {str(base_dir)} "
+            f"--pretrainModel {columbia_root / 'weight' / 'finetuning_TalkSet.model'}"
+        )
 
         columbia_start_time = time.time()
-        subprocess.run(columbia_command, check=True)
+        subprocess.run(columbia_command, cwd=str(columbia_root), shell=True)
         columbia_end_time = time.time()
         print(
             f"Columbia script completed in {columbia_end_time - columbia_start_time:.2f} seconds")
-    else:
-        print(f"Columbia script not found: {columbia_script_path}")
 
-    if not tracks_path.exists() and faces_path.exists():
-        shutil.copy(faces_path, tracks_path)
+        tracks_path = clip_dir / "pywork" / "tracks.pckl"
+        scores_path = clip_dir / "pywork" / "scores.pckl"
+        if not tracks_path.exists() or not scores_path.exists():
+            raise FileNotFoundError("Tracks or scores not found for clip")
 
-    if use_oss:
-        columbia_tracks_key = _columbia_key(s3_key, "tracks.pckl")
-        columbia_scores_key = _columbia_key(s3_key, "scores.pckl")
-        columbia_faces_key = _columbia_key(s3_key, "faces.pckl")
-        columbia_tracks_json_key = _columbia_key(s3_key, "tracks.json")
-        columbia_scores_json_key = _columbia_key(s3_key, "scores.json")
-        columbia_faces_json_key = _columbia_key(s3_key, "faces.json")
-        storage = s3_client or get_storage()
-        if tracks_path.exists():
-            storage.upload(str(tracks_path), columbia_tracks_key)
-        if faces_path.exists():
-            storage.upload(str(faces_path), columbia_faces_key)
-        if scores_path.exists():
-            storage.upload(str(scores_path), columbia_scores_key)
-        tracks_json_path = pywork_dir / "tracks.json"
-        scores_json_path = pywork_dir / "scores.json"
-        faces_json_path = pywork_dir / "faces.json"
-        if tracks_json_path.exists():
-            storage.upload(str(tracks_json_path), columbia_tracks_json_key)
-        if scores_json_path.exists():
-            storage.upload(str(scores_json_path), columbia_scores_json_key)
-        if faces_json_path.exists():
-            storage.upload(str(faces_json_path), columbia_faces_json_key)
-        try:
-            if not tracks_path.exists() and storage.head(columbia_tracks_key):
-                storage.download(columbia_tracks_key, str(tracks_path))
-        except Exception as exc:
-            print(f"[columbia] head/download tracks failed key={columbia_tracks_key} err={exc}")
-        try:
-            if not faces_path.exists() and storage.head(columbia_faces_key):
-                storage.download(columbia_faces_key, str(faces_path))
-        except Exception as exc:
-            print(f"[columbia] head/download faces failed key={columbia_faces_key} err={exc}")
-        try:
-            if not scores_path.exists() and storage.head(columbia_scores_key):
-                storage.download(columbia_scores_key, str(scores_path))
-        except Exception as exc:
-            print(f"[columbia] head/download scores failed key={columbia_scores_key} err={exc}")
+        with open(tracks_path, "rb") as f:
+            tracks = pickle.load(f)
 
-    if use_oss and (not tracks_path.exists() or not scores_path.exists()):
-        columbia_tracks_key = _columbia_key(s3_key, "tracks.pckl")
-        columbia_scores_key = _columbia_key(s3_key, "scores.pckl")
-        storage = s3_client or get_storage()
-        missing_keys = []
-        try:
-            if not tracks_path.exists():
-                if storage.head(columbia_tracks_key):
-                    storage.download(columbia_tracks_key, str(tracks_path))
-                else:
-                    missing_keys.append(columbia_tracks_key)
-        except Exception as exc:
-            print(f"[columbia] head/download tracks failed key={columbia_tracks_key} err={exc}")
-        try:
-            if not scores_path.exists():
-                if storage.head(columbia_scores_key):
-                    storage.download(columbia_scores_key, str(scores_path))
-                else:
-                    missing_keys.append(columbia_scores_key)
-        except Exception as exc:
-            print(f"[columbia] head/download scores failed key={columbia_scores_key} err={exc}")
-        if missing_keys:
-            print(f"[columbia] outputs missing in oss: {missing_keys}")
-
-    if not tracks_path.exists() or not scores_path.exists():
-        print("Columbia outputs missing; skipping tracking-based render step.")
-        return {"clip_name": clip_name, "output_s3_key": None}
-
-    with open(tracks_path, "rb") as f:
-        tracks = pickle.load(f)
-
-    with open(scores_path, "rb") as f:
-        scores = pickle.load(f)
+        with open(scores_path, "rb") as f:
+            scores = pickle.load(f)
 
     cvv_start_time = time.time()
     create_vertical_video(
@@ -543,7 +569,9 @@ def process_clip(base_dir: pathlib.Path, original_video_path: pathlib.Path, s3_k
             client = s3_client or get_storage()
             client.upload(str(subtitle_output_path), output_s3_key)
     else:
-        client.upload(str(subtitle_output_path), output_s3_key)
+        bucket = _get_s3_bucket()
+        client.upload_file(
+            subtitle_output_path, bucket, output_s3_key)
     return {"output_s3_key": output_s3_key, "skipped": False}
 
 
@@ -551,6 +579,7 @@ class VideoProcessor:
     def __init__(self, gemini_model: str | None = None) -> None:
         self.gemini_model = gemini_model or os.getenv(
             "GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+        self.whisperx_model_name = os.getenv("WHISPERX_MODEL", "large-v2")
         self.whisperx_model = None
         self.alignment_model = None
         self.metadata = None
@@ -559,6 +588,8 @@ class VideoProcessor:
     def load_models(self) -> None:
         if self.whisperx_model is not None:
             return
+
+        total_start = time.time()
 
         import torchaudio
         if not hasattr(torchaudio, "AudioMetaData"):
@@ -620,14 +651,19 @@ class VideoProcessor:
             torch.load = _patched_torch_load
             torch._clipper_patched_load = True
 
-        whisperx_model_name = os.getenv("WHISPERX_MODEL", "large-v2")
+        model_start = time.time()
         self.whisperx_model = whisperx.load_model(
-            whisperx_model_name, device=self.device, compute_type=compute_type)
+            self.whisperx_model_name, device=self.device, compute_type=compute_type)
+        whisper_load_time = time.time() - model_start
+        print(f"WhisperX model loaded in {whisper_load_time:.2f} seconds (device={self.device})")
 
+        align_start = time.time()
         self.alignment_model, self.metadata = whisperx.load_align_model(
             language_code="en",
             device=self.device
         )
+        align_load_time = time.time() - align_start
+        print(f"Alignment model loaded in {align_load_time:.2f} seconds")
 
         print("Transcription models loaded...")
 
@@ -639,35 +675,35 @@ class VideoProcessor:
         else:
             self.gemini_client = None
 
+        total_time = time.time() - total_start
+        print(f"Model initialization completed in {total_time:.2f} seconds")
+
     def _ensure_models(self) -> None:
         if self.whisperx_model is None:
             self.load_models()
 
     def transcribe_video(self, base_dir: pathlib.Path, video_path: pathlib.Path) -> list:
         audio_path = base_dir / "audio.wav"
+        extract_start = time.time()
         extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
-        try:
-            subprocess.run(
-                extract_cmd,
-                shell=True,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            print(f"ffmpeg audio extract failed: {extract_cmd}")
-            if exc.stdout:
-                print(f"ffmpeg stdout:\n{exc.stdout}")
-            if exc.stderr:
-                print(f"ffmpeg stderr:\n{exc.stderr}")
-            raise
+        subprocess.run(extract_cmd, shell=True,
+                       check=True, capture_output=True)
+        print(f"Audio extraction took {time.time() - extract_start:.2f} seconds")
 
         print("Starting transcription with WhisperX...")
         start_time = time.time()
 
         audio = whisperx.load_audio(str(audio_path))
-        result = self.whisperx_model.transcribe(audio, batch_size=16)
+        transcribe_start = time.time()
+        disable_vad = os.getenv("WHISPERX_DISABLE_VAD", "").lower() in ("1", "true", "yes")
+        try:
+            result = self.whisperx_model.transcribe(audio, batch_size=16, vad=not disable_vad)
+        except TypeError:
+            # Fallback for older whisperx versions without vad kwarg
+            result = self.whisperx_model.transcribe(audio, batch_size=16)
+        transcribe_time = time.time() - transcribe_start
 
+        align_start = time.time()
         result = whisperx.align(
             result["segments"],
             self.alignment_model,
@@ -676,9 +712,10 @@ class VideoProcessor:
             device=self.device,
             return_char_alignments=False
         )
+        align_time = time.time() - align_start
 
         duration = time.time() - start_time
-        print("Transcription and alignment took " + str(duration) + " seconds")
+        print(f"Transcription took {transcribe_time:.2f} seconds; alignment took {align_time:.2f} seconds; total {duration:.2f} seconds")
 
         segments = []
 
@@ -693,31 +730,36 @@ class VideoProcessor:
         return segments
 
     def identify_moments(self, transcript: list):
-        if self.gemini_client is None:
-            return "[]"
-        response = self.gemini_client.models.generate_content(model=self.gemini_model, contents="""
-    This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 30 and maximum of 60 seconds long. The clip should never exceed 60 seconds.
+        transcript_text = str(transcript)
+        max_chars = int(os.getenv("LOCAL_LLM_MAX_CHARS", "4000"))
+        if len(transcript_text) > max_chars:
+            transcript_text = transcript_text[:max_chars]
+        prompt = """
+Find 1-3 meaningful clips (stories, Q&A) from the transcript between 30 and 60 seconds long. Do NOT return word-level or sub-second spans. If you cannot find valid clips, return [].
 
-    Your task is to find and extract stories, or question and their corresponding answers from the transcript.
-    Each clip should begin with the question and conclude with the answer.
-    It is acceptable for the clip to include a few additional sentences before a question if it aids in contextualizing the question.
+Rules:
+- Use only provided timestamps; do not fabricate or adjust them.
+- Clips must be 30-60 seconds inclusive, non-overlapping, and start/end on sentence boundaries.
+- Output JSON readable by json.loads, e.g. [{"start": 12.3, "end": 55.7}, {"start": ...}].
+- If unsure, prefer a single ~45-60s clip spanning a coherent segment.
 
-    Please adhere to the following rules:
-    - Ensure that clips do not overlap with one another.
-    - Start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
-    - Only use the start and end timestamps provided in the input. modifying timestamps is not allowed.
-    - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{"start": seconds, "end": seconds}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
-    - Aim to generate longer clips between 40-60 seconds, and ensure to include as much content from the context as viable.
+Avoid greetings, fillers, and goodbyes.
 
-    Avoid including:
-    - Moments of greeting, thanking, or saying goodbye.
-    - Non-question and answer interactions.
-
-    If there are no valid clips to extract, the output should be an empty list [], in JSON format. Also readable by json.loads() in Python.
-
-    The transcript is as follows:\n\n""" + str(transcript))
-        print(f"Identified moments response: ${response.text}")
-        return response.text
+Transcript:\n\n""" + transcript_text
+        if self.gemini_client is not None:
+            llm_start = time.time()
+            response = self.gemini_client.models.generate_content(
+                model=self.gemini_model,
+                contents=prompt,
+            )
+            print(f"Identify moments via Gemini took {time.time() - llm_start:.2f} seconds")
+            print(f"Identified moments response: ${response.text}")
+            return response.text
+        llm_start = time.time()
+        local_response = _call_local_llm(prompt)
+        print(f"Identify moments via local LLM took {time.time() - llm_start:.2f} seconds")
+        print(f"Identified moments response: {local_response}")
+        return local_response
 
     def process_video_action(self, s3_key: str) -> dict:
         self._ensure_models()
@@ -740,12 +782,19 @@ class VideoProcessor:
             identified_moments_raw = self.identify_moments(transcript_segments)
 
             clip_moments = parse_clip_moments(identified_moments_raw)
-            if not _local_path_from_key(s3_key):
-                plan_key = _build_plan_key(s3_key)
-                plan_path = base_dir / "clip_plan.json"
-                with open(plan_path, "w", encoding="utf-8") as handle:
-                    json.dump(clip_moments, handle)
-                s3_client.upload(str(plan_path), plan_key)
+            filtered = []
+            for m in clip_moments or []:
+                try:
+                    start = float(m.get("start", 0))
+                    end = float(m.get("end", 0))
+                    dur = end - start
+                    if 30.0 <= dur <= 60.0:
+                        filtered.append({"start": start, "end": end})
+                except Exception:
+                    continue
+            clip_moments = filtered
+            if not clip_moments:
+                clip_moments = _fallback_clip_moments(transcript_segments)
 
             # 3. Process clips
             for index, moment in enumerate(clip_moments[:5]):

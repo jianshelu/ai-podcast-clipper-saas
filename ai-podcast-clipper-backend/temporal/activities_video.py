@@ -1,4 +1,5 @@
 # temporal/activities_video.py
+import os
 import shutil
 import threading
 
@@ -73,7 +74,7 @@ def transcribe_activity(s3_key: str) -> list:
         base_dir, video_path, _ = download_video(s3_key)
         return _run_with_heartbeat(lambda: processor.transcribe_video(base_dir, video_path))
     finally:
-        if base_dir and base_dir.exists():
+        if base_dir and base_dir.exists() and not os.getenv("DEBUG_KEEP_TEMP"):
             print(f"Cleaning up temp dir after {base_dir}")
             shutil.rmtree(base_dir, ignore_errors=True)
 
@@ -83,6 +84,17 @@ def highlight_activity(transcript_segments: list) -> list:
     processor = _get_processor()
     identified_moments_raw = processor.identify_moments(transcript_segments)
     clip_moments = parse_clip_moments(identified_moments_raw)
+    filtered = []
+    for m in clip_moments or []:
+        try:
+            start = float(m.get("start", 0))
+            end = float(m.get("end", 0))
+            dur = end - start
+            if 30.0 <= dur <= 60.0:
+                filtered.append({"start": start, "end": end})
+        except Exception:
+            continue
+    clip_moments = filtered
     if not clip_moments:
         print("No clip moments from LLM; using fallback clip window.")
         clip_moments = _fallback_clip_moments(transcript_segments)
@@ -119,7 +131,7 @@ def render_clips_activity(s3_key: str, transcript_segments: list, clip_moments: 
         rendered = _run_with_heartbeat(_render)
         return {"rendered": rendered, "clip_count": len(rendered)}
     finally:
-        if base_dir and base_dir.exists():
+        if base_dir and base_dir.exists() and not os.getenv("DEBUG_KEEP_TEMP"):
             print(f"Cleaning up temp dir after {base_dir}")
             shutil.rmtree(base_dir, ignore_errors=True)
 
